@@ -1,0 +1,19 @@
+{
+  "name": "@teeify/cli",
+  "version": "0.0.1",
+  "description": "The Vercel for TEEs. Secure infrastructure for AI Agents.",
+  "main": "index.js",
+  "bin": {
+    "teeify": "index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teeify/teeify" 
+  },
+  "keywords": ["TEE", "Web3", "AI", "Security", "Nitro", "Enclave"],
+  "author": "Teeify Labs",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
