@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline/promises');
+const vm = require('vm');
 
 // TEEIFY_GATEWAY: .env in the current working directory, process env, or localhost
 // Example .env: TEEIFY_GATEWAY=http://3.120.x.x:3000
@@ -19,6 +20,7 @@ const c = {
     cyan: '\x1b[36m',
     green: '\x1b[32m',
     yellow: '\x1b[33m',
+    red: '\x1b[91m',
     dim: '\x1b[2m',
     reset: '\x1b[0m',
     bold: '\x1b[1m'
@@ -159,6 +161,24 @@ function encryptAgentCode(agentCode, publicKeyPem) {
     };
 }
 
+function encryptSecretValueRsa(value, publicKeyPem) {
+    const buf = Buffer.from(value, 'utf8');
+    try {
+        const encrypted = crypto.publicEncrypt(
+            {
+                key: publicKeyPem,
+                padding: crypto.constants.RSA_PKCS1_PADDING
+            },
+            buf
+        );
+        return encrypted.toString('base64');
+    } catch (e) {
+        throw new Error(
+            `RSA encryption failed (secret may be too large for the enclave key, or key is invalid): ${e.message}`
+        );
+    }
+}
+
 function gatewayBase() {
     return String(GATEWAY_URL).replace(/\/+$/, '');
 }
@@ -208,17 +228,241 @@ function formatAgentOutputForTerminal(value) {
     return String(value);
 }
 
+/** Replace strings and comments with spaces; keep newlines so line numbers stay aligned. */
+function stripJsForAwaitScan(src) {
+    const out = [];
+    let i = 0;
+    while (i < src.length) {
+        const c = src[i];
+        const c2 = src[i + 1];
+        if (c === '/' && c2 === '/') {
+            while (i < src.length && src[i] !== '\n') {
+                out.push(' ');
+                i++;
+            }
+            continue;
+        }
+        if (c === '/' && c2 === '*') {
+            out.push(' ', ' ');
+            i += 2;
+            while (i < src.length - 1 && !(src[i] === '*' && src[i + 1] === '/')) {
+                out.push(src[i] === '\n' ? '\n' : ' ');
+                i++;
+            }
+            if (i < src.length - 1) i += 2;
+            continue;
+        }
+        if (c === '"' || c === "'") {
+            const q = c;
+            out.push(' ');
+            i++;
+            while (i < src.length) {
+                if (src[i] === '\\' && i + 1 < src.length) {
+                    out.push(' ', ' ');
+                    i += 2;
+                    continue;
+                }
+                if (src[i] === q) {
+                    out.push(' ');
+                    i++;
+                    break;
+                }
+                out.push(src[i] === '\n' ? '\n' : ' ');
+                i++;
+            }
+            continue;
+        }
+        if (c === '`') {
+            out.push(' ');
+            i++;
+            while (i < src.length) {
+                if (src[i] === '\\' && i + 1 < src.length) {
+                    out.push(' ', ' ');
+                    i += 2;
+                    continue;
+                }
+                if (src[i] === '$' && src[i + 1] === '{') {
+                    out.push(' ', ' ');
+                    i += 2;
+                    let d = 1;
+                    while (i < src.length && d > 0) {
+                        if (src[i] === '{') d++;
+                        else if (src[i] === '}') d--;
+                        out.push(src[i] === '\n' ? '\n' : ' ');
+                        i++;
+                    }
+                    continue;
+                }
+                if (src[i] === '`') {
+                    out.push(' ');
+                    i++;
+                    break;
+                }
+                out.push(src[i] === '\n' ? '\n' : ' ');
+                i++;
+            }
+            continue;
+        }
+        out.push(c);
+        i++;
+    }
+    return out.join('');
+}
+
+function matchingParenLeft(s, closeIdx) {
+    let depth = 1;
+    let k = closeIdx - 1;
+    while (k >= 0 && depth > 0) {
+        if (s[k] === ')') depth++;
+        else if (s[k] === '(') depth--;
+        k--;
+    }
+    return k + 1;
+}
+
+function isFunctionBodyBrace(s, braceIdx) {
+    let j = braceIdx - 1;
+    while (j >= 0 && /\s/.test(s[j])) j--;
+    if (j < 0) return false;
+
+    if (s[j] === '>' && j > 0 && s[j - 1] === '=') {
+        return true;
+    }
+    if (s[j] !== ')') return false;
+    const openParen = matchingParenLeft(s, j);
+    if (openParen < 0) return false;
+    let k = openParen - 1;
+    while (k >= 0 && /\s/.test(s[k])) k--;
+    if (k > 0 && s[k] === '>' && s[k - 1] === '=') {
+        return true;
+    }
+    const beforeParen = s.slice(0, openParen).trimEnd();
+    return /(^|[\s;}])(async\s+)?function\s*(\*\s*)?[\w$]*\s*$/.test(beforeParen);
+}
+
+function isAwaitKeywordAt(s, i) {
+    if (i > 0) {
+        const prev = s[i - 1];
+        if (prev === '$' || /[\w$]/.test(prev)) return false;
+    }
+    if (!s.startsWith('await', i)) return false;
+    const after = s[i + 5];
+    if (after !== undefined && /[\w$]/.test(after)) return false;
+    if (/^await\s*:/.test(s.slice(i, i + 32))) return false;
+    return true;
+}
+
+function findTopLevelAwaitIssue(agentCode) {
+    const s = stripJsForAwaitScan(agentCode);
+    const braceStack = [];
+    let line = 1;
+    for (let i = 0; i < s.length; ) {
+        const ch = s[i];
+        if (ch === '\n') {
+            line++;
+            i++;
+            continue;
+        }
+        if (ch === '{') {
+            braceStack.push(isFunctionBodyBrace(s, i));
+            i++;
+            continue;
+        }
+        if (ch === '}') {
+            braceStack.pop();
+            i++;
+            continue;
+        }
+        if (isAwaitKeywordAt(s, i)) {
+            const inFunctionBody = braceStack.some(Boolean);
+            if (!inFunctionBody) {
+                const lines = agentCode.split('\n');
+                const snippet = lines[line - 1] !== undefined ? lines[line - 1].trim() : '';
+                return { line, snippet };
+            }
+            i += 5;
+            continue;
+        }
+        i++;
+    }
+    return null;
+}
+
+function printAgentSyntaxError(err, filePath) {
+    let line = err.lineNumber;
+    let col = err.columnNumber;
+    if (line == null && err.stack) {
+        const base = path.basename(filePath);
+        const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const m = new RegExp(`${escaped}:(\\d+)(?::(\\d+))?`).exec(err.stack);
+        if (m) {
+            line = Number(m[1]);
+            col = m[2] != null ? Number(m[2]) : col;
+        }
+    }
+    const loc = line != null ? `${line}${col != null ? `:${col}` : ''}` : 'unknown';
+    const rule = `${c.red}${c.bold}━━━ Invalid JavaScript — deploy aborted ━━━${c.reset}`;
+    console.log(`\n${rule}`);
+    console.log(`${c.dim}File:${c.reset}       ${filePath}`);
+    console.log(`${c.dim}Location:${c.reset}   ${c.red}${loc}${c.reset}`);
+    console.log(`${c.dim}Reason:${c.reset}     ${c.red}${err.message}${c.reset}`);
+    if (/await/i.test(err.message) && /async|module/i.test(err.message)) {
+        console.log(
+            `\n${c.dim}Tip:${c.reset} Wrap ${c.bold}await${c.reset}${c.dim} usage in ${c.reset}` +
+            `${c.bold}async function run() { ... }${c.reset}${c.dim} and call ${c.reset}${c.bold}run()${c.reset}${c.dim}.${c.reset}`
+        );
+    }
+    console.log(`\n${c.dim}Fix the error in your agent source and try again.${c.reset}\n`);
+}
+
+function printTopLevelAwaitError(issue, filePath) {
+    const rule = `${c.red}${c.bold}━━━ Top-level await — deploy aborted ━━━${c.reset}`;
+    console.log(`\n${rule}`);
+    console.log(`${c.dim}File:${c.reset}       ${filePath}`);
+    console.log(`${c.dim}Line:${c.reset}       ${c.red}${issue.line}${c.reset}`);
+    if (issue.snippet) {
+        console.log(`${c.dim}Source:${c.reset}     ${c.dim}${issue.snippet}${c.reset}`);
+    }
+    console.log(`\n${c.red}The Teeify enclave does not support top-level ${c.bold}await${c.reset}${c.red}.${c.reset}`);
+    console.log(`${c.dim}Put async logic inside an async entrypoint, for example:${c.reset}`);
+    console.log(`${c.dim}  async function run() {${c.reset}`);
+    console.log(`${c.dim}    // … your code using await …${c.reset}`);
+    console.log(`${c.dim}  }${c.reset}`);
+    console.log(`${c.dim}  run();${c.reset}\n`);
+}
+
+function validateAgentBeforeDeploy(agentCode, filePath) {
+    try {
+        new vm.Script(agentCode, { filename: path.basename(filePath) || 'agent.js' });
+    } catch (e) {
+        if (e instanceof SyntaxError) {
+            printAgentSyntaxError(e, filePath);
+            process.exit(1);
+        }
+        throw e;
+    }
+    const awaitIssue = findTopLevelAwaitIssue(agentCode);
+    if (awaitIssue) {
+        printTopLevelAwaitError(awaitIssue, filePath);
+        process.exit(1);
+    }
+}
+
 async function deploy() {
     console.log(`\n${c.bold}▲ Teeify${c.reset} Deploying secure agent to AWS Nitro Enclave...\n`);
 
     try {
         const config = readProjectConfig();
-        const authConfig = readAuthConfig();
         if (!fs.existsSync(AGENT_FILE)) {
             throw new Error(`File ${AGENT_FILE} not found. Please create it first.`);
         }
 
         const agentCode = fs.readFileSync(AGENT_FILE, 'utf8');
+
+        console.log(`${c.dim}> Validating ${AGENT_FILE}...${c.reset}`);
+        validateAgentBeforeDeploy(agentCode, AGENT_FILE);
+
+        const authConfig = readAuthConfig();
 
         console.log(`${c.dim}> Packaging ${config.agent_name} from ${AGENT_FILE} (${agentCode.length} bytes)...${c.reset}`);
         console.log(`${c.dim}> Fetching enclave encryption key...${c.reset}`);
@@ -281,6 +525,7 @@ async function execute() {
         const body = parseExecuteBodyFromArgs(args);
         const config = readProjectConfig();
         const authConfig = readAuthConfig();
+
         const url = `${gatewayBase()}/agent/${encodeURIComponent(config.agent_name)}/execute`;
 
         const response = await fetch(url, {
@@ -314,6 +559,64 @@ async function execute() {
         console.log(`\n${c.yellow}✖ Execute failed.${c.reset}`);
         if (err.cause && err.cause.code === 'ECONNREFUSED') {
             console.log(`${c.dim}Could not connect to Teeify Gateway at ${GATEWAY_URL}. Is your server running?${c.reset}\n`);
+        } else {
+            console.log(`${c.dim}${err.message}${c.reset}\n`);
+        }
+    }
+}
+
+async function secretsSet() {
+    if (args[0] !== 'set') {
+        console.log(`\n${c.dim}Usage: teeify secrets set <KEY> <VALUE>${c.reset}\n`);
+        process.exitCode = 1;
+        return;
+    }
+
+    console.log(`\n${c.bold}▲ Teeify${c.reset} Storing encrypted secret...\n`);
+
+    try {
+        const name = args[1];
+        const valueParts = args.slice(2);
+        if (!name || valueParts.length === 0) {
+            console.log(
+                `${c.dim}Usage: teeify secrets set <KEY> <VALUE>${c.reset}\n`
+            );
+            process.exitCode = 1;
+            return;
+        }
+
+        const value = valueParts.join(' ');
+        const authConfig = readAuthConfig();
+
+        console.log(`${c.dim}> Fetching enclave public key...${c.reset}`);
+        const publicKeyPem = await fetchEnclavePublicKey(authConfig.api_key);
+        console.log(`${c.dim}> Encrypting value with RSA (PKCS#1 v1.5)...${c.reset}`);
+        const encrypted_value_b64 = encryptSecretValueRsa(value, publicKeyPem);
+
+        const response = await fetch(`${GATEWAY_URL}/secrets`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authConfig.api_key}`
+            },
+            body: JSON.stringify({ name, encrypted_value_b64 })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Gateway returned ${response.status}: ${errorText}`);
+        }
+
+        console.log(
+            `${c.green}✔ Secret ${c.cyan}${name}${c.green} set (RSA-encrypted for enclave).${c.reset}\n`
+        );
+    } catch (err) {
+        process.exitCode = 1;
+        console.log(`\n${c.yellow}✖ secrets set failed.${c.reset}`);
+        if (err.cause && err.cause.code === 'ECONNREFUSED') {
+            console.log(
+                `${c.dim}Could not connect to Teeify Gateway at ${GATEWAY_URL}.${c.reset}\n`
+            );
         } else {
             console.log(`${c.dim}${err.message}${c.reset}\n`);
         }
@@ -356,7 +659,11 @@ if (command === 'deploy') {
     login();
 } else if (command === 'execute') {
     execute();
+} else if (command === 'secrets') {
+    secretsSet();
 } else {
     console.log(`\n${c.bold}▲ Teeify CLI${c.reset}`);
-    console.log(`Usage: teeify [login <API_KEY> | init [agent-name] | deploy | execute [--data '<json>']]\n`);
+    console.log(
+        `Usage: teeify [login <API_KEY> | init [agent-name] | deploy | execute [--data '<json>'] | secrets set <KEY> <VALUE>]\n`
+    );
 }
