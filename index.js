@@ -565,6 +565,26 @@ async function execute() {
     }
 }
 
+function readSecretsProjectContext() {
+    if (!fs.existsSync(CONFIG_FILE)) {
+        throw new Error('No teeify.json found. Run this command inside your agent project folder.');
+    }
+
+    let config;
+    try {
+        config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch {
+        throw new Error('No teeify.json found. Run this command inside your agent project folder.');
+    }
+
+    const agentName = config.agent_name;
+    if (agentName === undefined || agentName === null || String(agentName).trim() === '') {
+        throw new Error('No teeify.json found. Run this command inside your agent project folder.');
+    }
+
+    return agentName;
+}
+
 async function secretsSet() {
     if (args[0] !== 'set') {
         console.log(`\n${c.dim}Usage: teeify secrets set <KEY> <VALUE>${c.reset}\n`);
@@ -575,9 +595,9 @@ async function secretsSet() {
     console.log(`\n${c.bold}▲ Teeify${c.reset} Storing encrypted secret...\n`);
 
     try {
-        const name = args[1];
+        const secretKey = args[1];
         const valueParts = args.slice(2);
-        if (!name || valueParts.length === 0) {
+        if (!secretKey || valueParts.length === 0) {
             console.log(
                 `${c.dim}Usage: teeify secrets set <KEY> <VALUE>${c.reset}\n`
             );
@@ -586,6 +606,7 @@ async function secretsSet() {
         }
 
         const value = valueParts.join(' ');
+        const agentName = readSecretsProjectContext();
         const authConfig = readAuthConfig();
 
         console.log(`${c.dim}> Fetching enclave public key...${c.reset}`);
@@ -593,13 +614,14 @@ async function secretsSet() {
         console.log(`${c.dim}> Encrypting value with RSA (PKCS#1 v1.5)...${c.reset}`);
         const encrypted_value_b64 = encryptSecretValueRsa(value, publicKeyPem);
 
-        const response = await fetch(`${GATEWAY_URL}/secrets`, {
+        const url = `${gatewayBase()}/agent/${encodeURIComponent(agentName)}/secrets`;
+        const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${authConfig.api_key}`
             },
-            body: JSON.stringify({ name, encrypted_value_b64 })
+            body: JSON.stringify({ name: secretKey, encrypted_value_b64 })
         });
 
         if (!response.ok) {
@@ -608,7 +630,7 @@ async function secretsSet() {
         }
 
         console.log(
-            `${c.green}✔ Secret ${c.cyan}${name}${c.green} set (RSA-encrypted for enclave).${c.reset}\n`
+            `${c.green}✔ Secret ${c.cyan}${secretKey}${c.green} set for agent ${c.cyan}${agentName}${c.green} (RSA-encrypted for enclave).${c.reset}\n`
         );
     } catch (err) {
         process.exitCode = 1;
