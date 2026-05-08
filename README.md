@@ -1,37 +1,25 @@
-# Teeify CLI
+# Teeify CLI 🚀
 
-**Teeify is the [Vercel for TEEs](https://teeify.xyz): the orchestration layer for the autonomous economy.** The CLI delivers a full **init → deploy → execute** loop: you author JavaScript locally, ship it to a **hardware-secured AWS Nitro Enclave**, and receive provable, hardware-backed results—not promises.
+**Teeify is the [Vercel for TEEs](https://teeify.xyz): the orchestration layer for the autonomous economy.** 
 
----
-
-## Vision
-
-- **For Web3 teams:** On-chain and agent-driven systems need execution that is **isolated**, **attestable**, and **key-safe**. Teeify turns that into a deployment surface you can use like any other cloud workflow.
-- **For AI engineers:** Model and agent logic often requires **secrets**, **proprietary code**, and **auditable runs**. Teeify runs that logic where the **host OS, hypervisor, and public internet are not in the trust boundary**—and gives you a receipt you can verify.
+The CLI delivers a complete **init → login → deploy → execute** loop. Author JavaScript locally, ship it to a hardware-secured AWS Nitro Enclave, and manage sovereign AI agents with mathematical certainty.
 
 ---
 
-## How it works
+## 🛠 Features
 
-### Embedded JavaScript in silicon
+### 🔐 End-to-End Privacy
+Your code and secrets (API keys) are encrypted on your Mac using **RSA-OAEP (SHA-256)** before they ever touch the internet. They are only decrypted inside the physical CPU of the vault.
 
-Every enclave includes a **high-performance, pure-Rust JavaScript engine ([Boa](https://github.com/boa-dev/boa), `boa_engine`)**. Your `agent.js` is evaluated **inside the enclave**—a **silicon vault** with **no dependency on the host** for that execution. Logic runs in a measured, attested environment, not on a shared app server or in a browser you do not control.
+### 💾 Persistent Sovereign Identities
+Unlike ephemeral containers, Teeify agents have permanent identities. We utilize **AWS KMS envelope encryption** to seal private keys, allowing agent wallets to survive server restarts and migrations across the global fleet.
 
-### Hardware wallets
-
-**Each deployment yields a unique Ethereum address.** The corresponding **private key is generated and held inside the Nitro enclave**; it **never** leaves the hardware-backed boundary exposed to typical cloud paths. Wallets are **per-deployment artifacts**, not shared secrets on a control plane you have to take on trust alone.
-
-### Trust, but verify
-
-**Every run produces a cryptographic attestation (Base64)** tied to the enclave and its configuration. You do not have to trust a dashboard sentence—you can **verify the proof** yourself:
-
-**[https://teeify.xyz/verify](https://teeify.xyz/verify)**
-
-This is the heart of the model: **attested compute** for the next generation of agents and on-chain automations.
+### 📡 Secure Egress Proxy
+Agents can securely access the internet (OpenAI, Coinbase, Stripe) via a hardware-isolated **TLS-passthrough proxy**. The host server acts as a blind courier and cannot inspect your sensitive data or API keys.
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 npm install -g @teeify/cli
@@ -39,90 +27,71 @@ npm install -g @teeify/cli
 
 ---
 
-## Quick start: init to execute
+## 🚀 Quick Start
 
-### 1. Initialize a project
-
+### 1. Authenticate
+Get your API key from the [Teeify Dashboard](https://teeify.xyz/dashboard).
 ```bash
-teeify init my-secure-bot
+teeify login <YOUR_API_KEY>
 ```
 
-This creates **`agent.js`** and **`teeify.json`** in the current directory. The config stores your `agent_name`, which is sent with every deployment. If you omit the name, the CLI prompts for one; in non-interactive environments, it generates a random hyphenated name.
-
-### 2. Author your agent
-
-Edit `agent.js`. Example: a small **secret** calculation and a **greeting** (values exist only in the enclave for that execution):
-
-```javascript
-// agent.js — runs inside the TEE; host never sees the secret factor
-const secretFactor = 0x2b7e1516;
-const publicInput = 42;
-const result = (publicInput * secretFactor) & 0xffffffff;
-
-console.log(`Hello from the Enclave — sealed computation: ${result}`);
-```
-
-### 3. Point the CLI at your gateway (optional)
-
-The CLI reads **`TEEIFY_GATEWAY`** from your environment or a **`.env`** file in the working directory (see `.env.example`). If unset, it defaults to `http://localhost:3000`.
-
+### 2. Initialize a Project
 ```bash
-# .env
-TEEIFY_GATEWAY=https://your-gateway.example.com
+teeify init my-oracle-bot
+```
+This creates **`agent.js`** and **`teeify.json`**. 
+
+### 3. Set Secure Secrets
+Store sensitive API keys (e.g., for Gemini or OpenAI) without Teeify or AWS ever seeing them in plaintext.
+```bash
+teeify secrets set GEMINI_API_KEY "sk-..."
 ```
 
-### 4. Deploy and run
-
+### 4. Deploy and Run
 ```bash
 teeify deploy
 ```
-
-The CLI **packages** your file, **POSTs** it to the gateway, and prints the **live execution** summary.
-
-### 5. Example output (illustrative)
-
-```text
-✔ Agent successfully deployed and executed in TEE!
-
-──────────────────────────────────────────────────
-📍 Wallet Address:  0x71C7656EC7ab88b098defB751B7401B5f6d8976F
-💻 Agent Output:    Hello from the Enclave — sealed computation: 1234567890
-🔐 Attestation:     eyJraWQiOiJuaXRyby1pcy0xMi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4u...
-──────────────────────────────────────────────────
-
-Verify hardware proof at: https://teeify.xyz/verify
-```
-
-*Replace the sample values with what your deployment returns. The attestation is truncated in the terminal; the full Base64 value is what you verify.*
+The CLI validates your syntax locally, encrypts your code, and injects it into a secure Nitro Enclave in Frankfurt.
 
 ---
 
-## Command reference
+## 💻 Example Agent (`agent.js`)
+
+Teeify embeds the high-performance **Boa JS Engine** inside the vault. Return a value or use `console.log` to capture output.
+
+```javascript
+async function run() {
+    // Access E2EE secrets
+    const apiKey = TEEIFY_SECRETS.GEMINI_API_KEY;
+    
+    // Fetch live data via secure proxy
+    const res = await teeify.fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");
+    const price = JSON.parse(res).data.amount;
+
+    return `BTC is currently $${price}. Vault signature ready.`;
+}
+
+run();
+```
+
+---
+
+## ⌨️ Command Reference
 
 | Command | Description |
 |--------|-------------|
-| `teeify init [agent-name]` | Create `agent.js` and `teeify.json` in the current directory. |
-| `teeify deploy` | Read `teeify.json`, deploy `agent.js`, and execute it in the TEE. |
+| `teeify login <key>` | Authenticate the CLI with your account. |
+| `teeify init [name]` | Initialize a new agent project directory. |
+| `teeify secrets set <K> <V>` | Encrypt and store a secret in the hardware vault. |
+| `teeify deploy` | Encrypt and deploy code to the enclave fleet. |
+| `teeify execute [--data 'JSON']` | Trigger an execution via webhook with dynamic data. |
 
 ---
 
-## Security posture (summary)
+## 🛡️ Trust, but Verify
+Every deployment generates an **AWS Hardware Attestation**. Use our public portal to verify that your agent is running un-tampered code on genuine Nitro hardware:
 
-- **Isolation:** Enclave memory is **separate** from the host; your JS runtime and secrets are not "just another process" on a shared instance.
-- **Attestation:** Each execution yields **verifiable** evidence of **what** ran and **in what** hardware context—ground truth for integrators and auditors.
-- **Verification:** **Don't trust, verify**—use **[teeify.xyz/verify](https://teeify.xyz/verify)** with the attestation you receive.
-
----
-
-## Links
-
-| Resource | URL |
-|----------|-----|
-| **Product** | [teeify.xyz](https://teeify.xyz) |
-| **Attestation verification** | [teeify.xyz/verify](https://teeify.xyz/verify) |
-| **X (Twitter)** | [@teeify_xyz](https://x.com/teeify_xyz) |
-
-**Status:** Closed alpha.
+**[https://teeify.xyz/verify](https://teeify.xyz/verify)**
 
 ---
 
