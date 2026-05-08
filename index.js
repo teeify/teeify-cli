@@ -8,9 +8,10 @@ const path = require('path');
 const readline = require('readline/promises');
 const vm = require('vm');
 
-// TEEIFY_GATEWAY: .env in the current working directory, process env, or localhost
-// Example .env: TEEIFY_GATEWAY=http://3.120.x.x:3000
-const GATEWAY_URL = process.env.TEEIFY_GATEWAY || 'http://localhost:3000';
+/** Production API base (no trailing slash). Override with TEEIFY_GATEWAY in env or .env. */
+const DEFAULT_GATEWAY = 'https://teeify.xyz/api';
+const GATEWAY_URL = process.env.TEEIFY_GATEWAY || DEFAULT_GATEWAY;
+
 const AGENT_FILE = 'agent.js';
 const CONFIG_FILE = 'teeify.json';
 const TEEIFY_DIR = path.join(os.homedir(), '.teeify');
@@ -29,21 +30,27 @@ const c = {
 const command = process.argv[2];
 const args = process.argv.slice(3);
 
-function randomAgentName() {
-    return `secure-bot-${crypto.randomBytes(2).toString('hex')}`;
-}
-
 function normalizeAgentName(name) {
     return name.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+function agentNameRequirementMessage() {
+    return 'Agent name is required (letters, numbers, hyphens only). Use: teeify init <agent-name> — e.g. teeify init my-trading-bot';
+}
+
 async function resolveAgentName(providedName) {
     if (providedName) {
-        return normalizeAgentName(providedName) || randomAgentName();
+        const normalized = normalizeAgentName(providedName);
+        if (!normalized) {
+            throw new Error(agentNameRequirementMessage());
+        }
+        return normalized;
     }
 
     if (!process.stdin.isTTY) {
-        return randomAgentName();
+        throw new Error(
+            `${agentNameRequirementMessage()} In non-interactive mode you must pass the name: teeify init <agent-name>`
+        );
     }
 
     const rl = readline.createInterface({
@@ -52,8 +59,12 @@ async function resolveAgentName(providedName) {
     });
 
     try {
-        const answer = await rl.question(`${c.bold}Agent name${c.reset} ${c.dim}(press enter for a random name): ${c.reset}`);
-        return normalizeAgentName(answer) || randomAgentName();
+        const answer = await rl.question(`${c.bold}Agent name${c.reset} ${c.dim}(required): ${c.reset}`);
+        const normalized = normalizeAgentName(answer);
+        if (!normalized) {
+            throw new Error(agentNameRequirementMessage());
+        }
+        return normalized;
     } finally {
         rl.close();
     }
@@ -64,9 +75,20 @@ function readProjectConfig() {
         throw new Error('No teeify.json found. Run teeify init first.');
     }
 
-    const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (!config.agent_name) {
-        throw new Error('teeify.json is missing agent_name. Run teeify init first.');
+    let config;
+    try {
+        config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch (e) {
+        throw new Error(
+            `teeify.json is invalid JSON. Fix the file format (${e.message}). Ensure "agent_name" is set.`
+        );
+    }
+
+    const raw = config.agent_name;
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+        throw new Error(
+            'teeify.json must include a non-empty "agent_name". Run teeify init <agent-name> or edit the file.'
+        );
     }
 
     return config;
@@ -106,6 +128,54 @@ function login() {
     }
 }
 
+/**
+ * Extract PEM from gateway fields; unwrap stringified JSON; normalize newlines; verify SPKI PEM header.
+ */
+function normalizeGatewayPublicKeyPem(rawKey) {
+    if (rawKey === undefined || rawKey === null || String(rawKey).trim() === '') {
+        throw new Error('Failed to extract public key from Gateway response.');
+    }
+
+    let key;
+
+    if (typeof rawKey === 'string' && rawKey.trimStart().startsWith('{')) {
+        let parsed;
+        try {
+            parsed = JSON.parse(rawKey.trim());
+        } catch (e) {
+            throw new Error(`Failed to parse nested public_key JSON: ${e.message}`);
+        }
+        const inner = parsed.public_key_pem || parsed.public_key;
+        if (inner === undefined || inner === null || String(inner).trim() === '') {
+            throw new Error('Failed to extract public key from Gateway response.');
+        }
+        key = typeof inner === 'string' ? inner : String(inner);
+    } else {
+        key = typeof rawKey === 'string' ? rawKey.trim() : String(rawKey).trim();
+    }
+
+    const pem = String(key).replace(/\\n/g, '\n').trim();
+
+    if (!pem.startsWith('-----BEGIN PUBLIC KEY-----')) {
+        const preview = pem.length >= 20 ? pem.slice(0, 20) : pem;
+        throw new Error(
+            `Invalid PEM: expected -----BEGIN PUBLIC KEY-----; first 20 characters received: ${JSON.stringify(preview)}`
+        );
+    }
+
+    return pem;
+}
+
+function assertPemBeforePublicEncrypt(pubKey) {
+    const s = String(pubKey);
+    if (!s.startsWith('-----BEGIN PUBLIC KEY-----')) {
+        const preview = s.length >= 20 ? s.slice(0, 20) : s;
+        throw new Error(
+            `Invalid PEM before publicEncrypt: expected -----BEGIN PUBLIC KEY-----; first 20 characters received: ${JSON.stringify(preview)}`
+        );
+    }
+}
+
 async function fetchEnclavePublicKey(apiKey) {
     const response = await fetch(`${GATEWAY_URL}/enclave-key`, {
         method: 'GET',
@@ -120,20 +190,31 @@ async function fetchEnclavePublicKey(apiKey) {
     }
 
     const contentType = response.headers.get('content-type') || '';
+    let node_id;
     let publicKeyPem;
 
     if (contentType.includes('application/json')) {
-        const data = await response.json();
-        publicKeyPem = data.public_key_pem || data.public_key || data.enclave_public_key || data.pem;
+        const keyData = await response.json();
+        let rawKey = keyData.public_key || keyData.public_key_pem;
+        if (rawKey === undefined || rawKey === null || String(rawKey).trim() === '') {
+            throw new Error('Failed to extract public key from Gateway response.');
+        }
+        node_id = keyData.node_id ?? keyData.nodeId;
+        publicKeyPem = normalizeGatewayPublicKeyPem(rawKey);
     } else {
-        publicKeyPem = await response.text();
+        const textBody = await response.text();
+        if (textBody === undefined || textBody === null || String(textBody).trim() === '') {
+            throw new Error('Failed to extract public key from Gateway response.');
+        }
+        publicKeyPem = normalizeGatewayPublicKeyPem(textBody);
     }
 
-    if (!publicKeyPem || !publicKeyPem.includes('BEGIN') || !publicKeyPem.includes('PUBLIC KEY')) {
-        throw new Error('Gateway returned an invalid enclave public key.');
-    }
-
-    return publicKeyPem.trim();
+    return {
+        publicKeyPem,
+        ...(node_id !== undefined && node_id !== null && String(node_id).trim() !== ''
+            ? { node_id }
+            : {})
+    };
 }
 
 function encryptAgentCode(agentCode, publicKeyPem) {
@@ -146,10 +227,12 @@ function encryptAgentCode(agentCode, publicKeyPem) {
     ]);
     const authTag = cipher.getAuthTag();
     const encryptedCode = Buffer.concat([ciphertext, authTag]);
+    assertPemBeforePublicEncrypt(publicKeyPem);
     const encryptedAesKey = crypto.publicEncrypt(
         {
             key: publicKeyPem,
-            padding: crypto.constants.RSA_PKCS1_PADDING
+            padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+            oaepHash: 'sha256'
         },
         aesKey
     );
@@ -164,10 +247,12 @@ function encryptAgentCode(agentCode, publicKeyPem) {
 function encryptSecretValueRsa(value, publicKeyPem) {
     const buf = Buffer.from(value, 'utf8');
     try {
+        assertPemBeforePublicEncrypt(publicKeyPem);
         const encrypted = crypto.publicEncrypt(
             {
                 key: publicKeyPem,
-                padding: crypto.constants.RSA_PKCS1_PADDING
+                padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+                oaepHash: 'sha256'
             },
             buf
         );
@@ -467,9 +552,17 @@ async function deploy() {
         console.log(`${c.dim}> Packaging ${config.agent_name} from ${AGENT_FILE} (${agentCode.length} bytes)...${c.reset}`);
         console.log(`${c.dim}> Fetching enclave encryption key...${c.reset}`);
 
-        const publicKeyPem = await fetchEnclavePublicKey(authConfig.api_key);
+        const enclaveKey = await fetchEnclavePublicKey(authConfig.api_key);
         console.log(`${c.dim}> Encrypting agent code for enclave-only execution...${c.reset}`);
-        const encryptedPayload = encryptAgentCode(agentCode, publicKeyPem);
+        const encryptedPayload = encryptAgentCode(agentCode, enclaveKey.publicKeyPem);
+
+        const deployBody = {
+            agent_name: config.agent_name,
+            encrypted_code_b64: encryptedPayload.encrypted_code_b64,
+            aes_iv_b64: encryptedPayload.aes_iv_b64,
+            encrypted_aes_key_b64: encryptedPayload.encrypted_aes_key_b64,
+            ...(enclaveKey.node_id !== undefined ? { node_id: enclaveKey.node_id } : {})
+        };
 
         const response = await fetch(`${GATEWAY_URL}/deploy`, {
             method: 'POST',
@@ -477,12 +570,7 @@ async function deploy() {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${authConfig.api_key}`
             },
-            body: JSON.stringify({
-                agent_name: config.agent_name,
-                encrypted_code_b64: encryptedPayload.encrypted_code_b64,
-                aes_iv_b64: encryptedPayload.aes_iv_b64,
-                encrypted_aes_key_b64: encryptedPayload.encrypted_aes_key_b64
-            })
+            body: JSON.stringify(deployBody)
         });
 
         if (!response.ok) {
@@ -494,16 +582,25 @@ async function deploy() {
 
         console.log(`\n${c.green}✔ Agent successfully deployed and executed in TEE!${c.reset}\n`);
         console.log(`${c.dim}─${c.reset}`.repeat(50));
-        console.log(`${c.bold}📍 Wallet Address:${c.reset}  ${c.cyan}${data.wallet_address}${c.reset}`);
-        console.log(`${c.bold}💻 Agent Output:${c.reset}    ${c.yellow}${data.execution_output ?? ''}${c.reset}`);
+
+        const deployLabelCol = 26;
+        const deployDetailRow = (labelText, valueRendered) => {
+            const pad = Math.max(1, deployLabelCol - labelText.length);
+            console.log(`${c.bold}${labelText}${c.reset}${' '.repeat(pad)}${valueRendered}`);
+        };
+        deployDetailRow('📍 Wallet Address:', `${c.cyan}${data.wallet_address}${c.reset}`);
+        deployDetailRow('💻 Agent Output:', `${c.yellow}${data.execution_output ?? ''}${c.reset}`);
         const att = data.attestation_b64;
-        console.log(`${c.bold}🔐 Attestation:${c.reset}     ${att ? `${att.substring(0, 30)}...` : 'No attestation returned'}`);
+        deployDetailRow(
+            '🔐 Attestation:',
+            att ? `${att.substring(0, 30)}...` : `${c.dim}No attestation returned${c.reset}`
+        );
         console.log(`${c.dim}─${c.reset}`.repeat(50));
-        
+
         console.log(`\n${c.yellow}Verify hardware proof at:${c.reset} https://teeify.xyz/verify\n`);
         const webhookUrl = `${gatewayBase()}/agent/${encodeURIComponent(config.agent_name)}/execute`;
-        console.log(`${c.bold}🔗 Webhook URL:${c.reset} ${c.cyan}${webhookUrl}${c.reset}`);
-        console.log(`${c.bold}🔑 Add header:${c.reset} ${c.dim}Authorization: Bearer <YOUR_API_KEY>${c.reset}\n`);
+        deployDetailRow('🔗 Webhook URL:', `${c.cyan}${webhookUrl}${c.reset}`);
+        deployDetailRow('🔑 Add header:', `${c.dim}Authorization: Bearer <YOUR_API_KEY>${c.reset}\n`);
 
     } catch (err) {
         process.exitCode = 1;
@@ -573,13 +670,17 @@ function readSecretsProjectContext() {
     let config;
     try {
         config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    } catch {
-        throw new Error('No teeify.json found. Run this command inside your agent project folder.');
+    } catch (e) {
+        throw new Error(
+            `teeify.json is invalid JSON. Fix the file format (${e.message}). Ensure "agent_name" is set.`
+        );
     }
 
     const agentName = config.agent_name;
     if (agentName === undefined || agentName === null || String(agentName).trim() === '') {
-        throw new Error('No teeify.json found. Run this command inside your agent project folder.');
+        throw new Error(
+            'teeify.json must include a non-empty "agent_name". Run teeify init <agent-name> or edit the file.'
+        );
     }
 
     return agentName;
@@ -610,9 +711,9 @@ async function secretsSet() {
         const authConfig = readAuthConfig();
 
         console.log(`${c.dim}> Fetching enclave public key...${c.reset}`);
-        const publicKeyPem = await fetchEnclavePublicKey(authConfig.api_key);
-        console.log(`${c.dim}> Encrypting value with RSA (PKCS#1 v1.5)...${c.reset}`);
-        const encrypted_value_b64 = encryptSecretValueRsa(value, publicKeyPem);
+        const enclaveKey = await fetchEnclavePublicKey(authConfig.api_key);
+        console.log(`${c.dim}> Encrypting value with RSA-OAEP (SHA-256)...${c.reset}`);
+        const encrypted_value_b64 = encryptSecretValueRsa(value, enclaveKey.publicKeyPem);
 
         const url = `${gatewayBase()}/agent/${encodeURIComponent(agentName)}/secrets`;
         const response = await fetch(url, {
@@ -630,7 +731,7 @@ async function secretsSet() {
         }
 
         console.log(
-            `${c.green}✔ Secret ${c.cyan}${secretKey}${c.green} set for agent ${c.cyan}${agentName}${c.green} (RSA-encrypted for enclave).${c.reset}\n`
+            `${c.green}✔ Secret ${c.cyan}${secretKey}${c.green} set for agent ${c.cyan}${agentName}${c.green} (RSA-OAEP encrypted for enclave).${c.reset}\n`
         );
     } catch (err) {
         process.exitCode = 1;
