@@ -8,6 +8,9 @@ The CLI delivers an **init → login → dev → deploy → execute** loop. Auth
 
 ## 🛠 Features
 
+### 🔑 Browser login
+Run **`teeify login`** with no arguments: the CLI opens the Teeify auth page, you sign in in the browser, and credentials are delivered back to the CLI over localhost. Paste-in API keys are optional.
+
 ### 🔐 End-to-End Privacy
 Your code and secrets (API keys) are encrypted on your machine using **RSA-OAEP (SHA-256)** before they touch the network. They are only decrypted inside the physical CPU of the vault.
 
@@ -39,7 +42,15 @@ The CLI talks to **`https://teeify.xyz/api`** by default. Override with **`TEEIF
 ## 🚀 Quick Start
 
 ### 1. Authenticate
-Get your API key from the [Teeify Dashboard](https://teeify.xyz/dashboard).
+Sign in through the Teeify control plane in your browser. No API key copy-paste required.
+
+```bash
+teeify login
+```
+
+The CLI starts a short-lived local callback server, opens **`https://teeify.xyz/cli/auth`** (or your configured gateway’s auth page), and saves the token to **`~/.teeify/config.json`** when you finish in the browser.
+
+**Manual API key (optional):** if you already have a key from the [dashboard](https://teeify.xyz/dashboard), you can still run:
 
 ```bash
 teeify login <YOUR_API_KEY>
@@ -116,7 +127,8 @@ In **`teeify dev`**, `TEEIFY_SECRETS` comes from `.env`; in production it reflec
 
 | Command | Description |
 |--------|-------------|
-| `teeify login <API_KEY>` | Save your API key to `~/.teeify/config.json`. |
+| `teeify login` | Open browser sign-in; token saved to `~/.teeify/config.json` via local callback. |
+| `teeify login <API_KEY>` | *(Optional)* Save an API key directly without the browser flow. |
 | `teeify init [agent-name]` | Create `agent.js` + `teeify.json`. Name required (arg or prompt). |
 | `teeify dev [agent-name] [--data '<json>']` | Bundle and run the agent in a local `vm` with enclave-like globals. |
 | `teeify secrets set <KEY> <VALUE>` | Encrypt and store a secret for the agent in `teeify.json`. |
