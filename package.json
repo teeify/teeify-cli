@@ -1,27 +1,37 @@
 {
   "name": "@teeify/cli",
-  "version": "0.0.1",
-  "description": "The Vercel for TEEs. Secure infrastructure for AI Agents.",
+  "version": "1.0.0",
+  "description": "The Vercel for TEEs. 1-click deployment for hardware-secured AI agents.",
   "main": "index.js",
   "bin": {
-    "teeify": "index.js"
+    "teeify": "./index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/teeify/teeify"
+    "url": "https://github.com/teeify/teeify-cli.git"
   },
   "keywords": [
-    "TEE",
-    "Web3",
-    "AI",
-    "Security",
-    "Nitro",
-    "Enclave"
+    "tee",
+    "enclave",
+    "aws-nitro",
+    "ai",
+    "crypto",
+    "confidential-compute",
+    "web3"
   ],
   "author": "Teeify Labs",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "esbuild": "^0.28.0"
+    "esbuild": "^0.20.0",
+    "dotenv": "^16.0.0"
   }
 }
