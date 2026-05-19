@@ -8,12 +8,20 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/teeify/teeify" 
+    "url": "https://github.com/teeify/teeify"
   },
-  "keywords": ["TEE", "Web3", "AI", "Security", "Nitro", "Enclave"],
+  "keywords": [
+    "TEE",
+    "Web3",
+    "AI",
+    "Security",
+    "Nitro",
+    "Enclave"
+  ],
   "author": "Teeify Labs",
   "license": "MIT",
   "dependencies": {
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "esbuild": "^0.28.0"
   }
 }
