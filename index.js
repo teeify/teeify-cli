@@ -25,11 +25,16 @@ const AGENT_ESBUILD_BUILD_OPTIONS = {
     format: 'cjs',
     platform: 'browser',
     target: 'es2020',
-    sourcemap: 'inline'
+    minify: true,
+    treeShaking: true,
+    external: ['node:*']
+    // sourcemap: 'inline' // Removed to save space
 };
+const HARDWARE_BUNDLE_BYTE_LIMIT = 2_000_000;
 const CONFIG_FILE = 'teeify.json';
 const TEEIFY_DIR = path.join(os.homedir(), '.teeify');
-const AUTH_CONFIG_FILE = path.join(TEEIFY_DIR, 'config.json');
+const AUTH_CREDENTIALS_FILE = path.join(TEEIFY_DIR, 'credentials');
+const LEGACY_AUTH_CONFIG_FILE = path.join(TEEIFY_DIR, 'config.json');
 
 const c = {
     cyan: '\x1b[36m',
@@ -108,28 +113,74 @@ function readProjectConfig() {
     return config;
 }
 
+function readCredentialsFilePath() {
+    if (fs.existsSync(AUTH_CREDENTIALS_FILE)) {
+        return AUTH_CREDENTIALS_FILE;
+    }
+    if (fs.existsSync(LEGACY_AUTH_CONFIG_FILE)) {
+        return LEGACY_AUTH_CONFIG_FILE;
+    }
+    return AUTH_CREDENTIALS_FILE;
+}
+
 function readAuthConfig() {
-    if (!fs.existsSync(AUTH_CONFIG_FILE)) {
-        throw new Error('No API key found. Run teeify login <API_KEY> first.');
+    const credentialsPath = readCredentialsFilePath();
+    if (!fs.existsSync(credentialsPath)) {
+        throw new Error('No API key found. Run teeify login first.');
     }
 
-    const config = JSON.parse(fs.readFileSync(AUTH_CONFIG_FILE, 'utf8'));
+    const config = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
     if (!config.api_key) {
-        throw new Error('No API key found. Run teeify login <API_KEY> first.');
+        throw new Error('No API key found. Run teeify login first.');
     }
 
     return config;
+}
+
+/** Requires api_key and user_id for namespaced agent URLs. */
+function requireAuthContext() {
+    const config = readAuthConfig();
+    const userId = config.user_id;
+    if (userId === undefined || userId === null || String(userId).trim() === '') {
+        throw new Error(
+            'Your CLI session is missing user_id. Run teeify login again to refresh credentials.'
+        );
+    }
+    return {
+        api_key: config.api_key,
+        user_id: String(userId).trim()
+    };
 }
 
 function gatewayBase() {
     return String(GATEWAY_URL).replace(/\/+$/, '');
 }
 
-function writeTeeifyAuthConfig(apiKey) {
+function namespacedAgentUrl(userId, agentName, action) {
+    return `${gatewayBase()}/agent/${encodeURIComponent(userId)}/${encodeURIComponent(agentName)}/${action}`;
+}
+
+function writeTeeifyCredentials({ apiKey, userId }) {
+    const payload = { api_key: apiKey };
+    if (userId !== undefined && userId !== null && String(userId).trim() !== '') {
+        payload.user_id = String(userId).trim();
+    }
     fs.mkdirSync(TEEIFY_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(AUTH_CONFIG_FILE, `${JSON.stringify({ api_key: apiKey }, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(AUTH_CREDENTIALS_FILE, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
     fs.chmodSync(TEEIFY_DIR, 0o700);
-    fs.chmodSync(AUTH_CONFIG_FILE, 0o600);
+    fs.chmodSync(AUTH_CREDENTIALS_FILE, 0o600);
+}
+
+function persistLoginCredentials(apiKey, userIdFromCallback) {
+    const apiKeyTrimmed = String(apiKey).trim();
+    const userId = userIdFromCallback != null ? String(userIdFromCallback).trim() : '';
+    if (!userId) {
+        throw new Error(
+            'Login did not include user_id. Run teeify login (browser flow) to refresh credentials.'
+        );
+    }
+    writeTeeifyCredentials({ apiKey: apiKeyTrimmed, userId });
+    return userId;
 }
 
 function escapeHtml(text) {
@@ -368,7 +419,7 @@ function openBrowserToUrl(targetUrl) {
 function loginViaBrowser() {
     let authHandled = false;
 
-    const server = http.createServer((req, res) => {
+    const server = http.createServer(async (req, res) => {
         if (authHandled) {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(loginAuthSuccessHtml());
@@ -378,9 +429,11 @@ function loginViaBrowser() {
         const addr = server.address();
         const port = addr && typeof addr === 'object' ? addr.port : 0;
         let token;
+        let userIdFromCallback;
         try {
             const reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
             token = reqUrl.searchParams.get('token');
+            userIdFromCallback = reqUrl.searchParams.get('user_id');
         } catch {
             res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(loginAuthErrorHtml('Invalid callback', 'The login redirect URL could not be parsed. Run teeify login again.'));
@@ -398,8 +451,19 @@ function loginViaBrowser() {
             return;
         }
 
+        if (!userIdFromCallback || String(userIdFromCallback).trim() === '') {
+            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(
+                loginAuthErrorHtml(
+                    'Missing user_id',
+                    'The auth callback did not include user_id. Ensure the Teeify auth page redirects with token and user_id query parameters.'
+                )
+            );
+            return;
+        }
+
         try {
-            writeTeeifyAuthConfig(String(token).trim());
+            persistLoginCredentials(String(token).trim(), userIdFromCallback);
         } catch (err) {
             res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(
@@ -433,11 +497,11 @@ function loginViaBrowser() {
     });
 }
 
-function login() {
+async function login() {
     const apiKey = args[0];
     if (apiKey) {
         try {
-            writeTeeifyAuthConfig(apiKey);
+            persistLoginCredentials(apiKey, null);
             console.log(`${c.green}Successfully logged in to Teeify.${c.reset}`);
         } catch (err) {
             process.exitCode = 1;
@@ -960,164 +1024,19 @@ function formatAgentOutputForTerminal(value) {
     return String(value);
 }
 
-/** Replace strings and comments with spaces; keep newlines so line numbers stay aligned. */
-function stripJsForAwaitScan(src) {
-    const out = [];
-    let i = 0;
-    while (i < src.length) {
-        const c = src[i];
-        const c2 = src[i + 1];
-        if (c === '/' && c2 === '/') {
-            while (i < src.length && src[i] !== '\n') {
-                out.push(' ');
-                i++;
-            }
-            continue;
-        }
-        if (c === '/' && c2 === '*') {
-            out.push(' ', ' ');
-            i += 2;
-            while (i < src.length - 1 && !(src[i] === '*' && src[i + 1] === '/')) {
-                out.push(src[i] === '\n' ? '\n' : ' ');
-                i++;
-            }
-            if (i < src.length - 1) i += 2;
-            continue;
-        }
-        if (c === '"' || c === "'") {
-            const q = c;
-            out.push(' ');
-            i++;
-            while (i < src.length) {
-                if (src[i] === '\\' && i + 1 < src.length) {
-                    out.push(' ', ' ');
-                    i += 2;
-                    continue;
-                }
-                if (src[i] === q) {
-                    out.push(' ');
-                    i++;
-                    break;
-                }
-                out.push(src[i] === '\n' ? '\n' : ' ');
-                i++;
-            }
-            continue;
-        }
-        if (c === '`') {
-            out.push(' ');
-            i++;
-            while (i < src.length) {
-                if (src[i] === '\\' && i + 1 < src.length) {
-                    out.push(' ', ' ');
-                    i += 2;
-                    continue;
-                }
-                if (src[i] === '$' && src[i + 1] === '{') {
-                    out.push(' ', ' ');
-                    i += 2;
-                    let d = 1;
-                    while (i < src.length && d > 0) {
-                        if (src[i] === '{') d++;
-                        else if (src[i] === '}') d--;
-                        out.push(src[i] === '\n' ? '\n' : ' ');
-                        i++;
-                    }
-                    continue;
-                }
-                if (src[i] === '`') {
-                    out.push(' ');
-                    i++;
-                    break;
-                }
-                out.push(src[i] === '\n' ? '\n' : ' ');
-                i++;
-            }
-            continue;
-        }
-        out.push(c);
-        i++;
+function formatBundleSize(bytes) {
+    if (bytes < 1024) {
+        return `${bytes} B`;
     }
-    return out.join('');
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function matchingParenLeft(s, closeIdx) {
-    let depth = 1;
-    let k = closeIdx - 1;
-    while (k >= 0 && depth > 0) {
-        if (s[k] === ')') depth++;
-        else if (s[k] === '(') depth--;
-        k--;
-    }
-    return k + 1;
-}
-
-function isFunctionBodyBrace(s, braceIdx) {
-    let j = braceIdx - 1;
-    while (j >= 0 && /\s/.test(s[j])) j--;
-    if (j < 0) return false;
-
-    if (s[j] === '>' && j > 0 && s[j - 1] === '=') {
-        return true;
-    }
-    if (s[j] !== ')') return false;
-    const openParen = matchingParenLeft(s, j);
-    if (openParen < 0) return false;
-    let k = openParen - 1;
-    while (k >= 0 && /\s/.test(s[k])) k--;
-    if (k > 0 && s[k] === '>' && s[k - 1] === '=') {
-        return true;
-    }
-    const beforeParen = s.slice(0, openParen).trimEnd();
-    return /(^|[\s;}])(async\s+)?function\s*(\*\s*)?[\w$]*\s*$/.test(beforeParen);
-}
-
-function isAwaitKeywordAt(s, i) {
-    if (i > 0) {
-        const prev = s[i - 1];
-        if (prev === '$' || /[\w$]/.test(prev)) return false;
-    }
-    if (!s.startsWith('await', i)) return false;
-    const after = s[i + 5];
-    if (after !== undefined && /[\w$]/.test(after)) return false;
-    if (/^await\s*:/.test(s.slice(i, i + 32))) return false;
-    return true;
-}
-
-function findTopLevelAwaitIssue(agentCode) {
-    const s = stripJsForAwaitScan(agentCode);
-    const braceStack = [];
-    let line = 1;
-    for (let i = 0; i < s.length; ) {
-        const ch = s[i];
-        if (ch === '\n') {
-            line++;
-            i++;
-            continue;
-        }
-        if (ch === '{') {
-            braceStack.push(isFunctionBodyBrace(s, i));
-            i++;
-            continue;
-        }
-        if (ch === '}') {
-            braceStack.pop();
-            i++;
-            continue;
-        }
-        if (isAwaitKeywordAt(s, i)) {
-            const inFunctionBody = braceStack.some(Boolean);
-            if (!inFunctionBody) {
-                const lines = agentCode.split('\n');
-                const snippet = lines[line - 1] !== undefined ? lines[line - 1].trim() : '';
-                return { line, snippet };
-            }
-            i += 5;
-            continue;
-        }
-        i++;
-    }
-    return null;
+function keccak256AgentLogicHash(agentCode) {
+    const { keccak256, toUtf8Bytes } = require('ethers');
+    return keccak256(toUtf8Bytes(agentCode));
 }
 
 function printAgentSyntaxError(err, filePath) {
@@ -1147,22 +1066,6 @@ function printAgentSyntaxError(err, filePath) {
     console.log(`\n${c.dim}Fix the error in your agent source and try again.${c.reset}\n`);
 }
 
-function printTopLevelAwaitError(issue, filePath) {
-    const rule = `${c.red}${c.bold}━━━ Top-level await — deploy aborted ━━━${c.reset}`;
-    console.log(`\n${rule}`);
-    console.log(`${c.dim}File:${c.reset}       ${filePath}`);
-    console.log(`${c.dim}Line:${c.reset}       ${c.red}${issue.line}${c.reset}`);
-    if (issue.snippet) {
-        console.log(`${c.dim}Source:${c.reset}     ${c.dim}${issue.snippet}${c.reset}`);
-    }
-    console.log(`\n${c.red}The Teeify enclave does not support top-level ${c.bold}await${c.reset}${c.red}.${c.reset}`);
-    console.log(`${c.dim}Put async logic inside an async entrypoint, for example:${c.reset}`);
-    console.log(`${c.dim}  async function run() {${c.reset}`);
-    console.log(`${c.dim}    // … your code using await …${c.reset}`);
-    console.log(`${c.dim}  }${c.reset}`);
-    console.log(`${c.dim}  run();${c.reset}\n`);
-}
-
 function validateAgentBeforeDeploy(agentCode, filePath) {
     try {
         new vm.Script(agentCode, { filename: path.basename(filePath) || 'agent.js' });
@@ -1172,11 +1075,6 @@ function validateAgentBeforeDeploy(agentCode, filePath) {
             process.exit(1);
         }
         throw e;
-    }
-    const awaitIssue = findTopLevelAwaitIssue(agentCode);
-    if (awaitIssue) {
-        printTopLevelAwaitError(awaitIssue, filePath);
-        process.exit(1);
     }
 }
 
@@ -1210,11 +1108,25 @@ async function deploy() {
         }
         const agentCode = out.text;
 
+        if (agentCode.length > HARDWARE_BUNDLE_BYTE_LIMIT) {
+            process.exitCode = 1;
+            const sizeMb = (agentCode.length / (1024 * 1024)).toFixed(1);
+            console.log(
+                `\n${c.yellow}✖ Error: Optimized bundle size (${sizeMb} MB) exceeds the 2MB hardware limit. Please reduce dependencies or logic complexity.${c.reset}\n`
+            );
+            return;
+        }
+
+        const logicHash = keccak256AgentLogicHash(agentCode);
+
+        // Save the bundle locally so the developer can audit or hash it
+        fs.writeFileSync('agent-audit-bundle.js', agentCode);
+
         const bundledLabel = `${AGENT_FILE} (bundled)`;
         console.log(`${c.dim}> Validating ${bundledLabel}...${c.reset}`);
         validateAgentBeforeDeploy(agentCode, bundledLabel);
 
-        const authConfig = readAuthConfig();
+        const authConfig = requireAuthContext();
 
         console.log(`${c.dim}> Packaging ${config.agent_name} (${agentCode.length} bytes bundled from ${AGENT_FILE})...${c.reset}`);
         console.log(`${c.dim}> Fetching enclave encryption key...${c.reset}`);
@@ -1246,8 +1158,15 @@ async function deploy() {
         }
 
         const data = await response.json();
+        const att = data.attestation_b64;
 
-        console.log(`\n${c.green}✔ Agent successfully deployed and executed in TEE!${c.reset}\n`);
+        console.log('');
+        if (att) {
+            console.log(`${c.bold}🔐 Hardware Attestation (AWS Nitro)${c.reset}`);
+            console.log(`${c.dim}${att}${c.reset}\n`);
+        }
+
+        console.log(`${c.green}✔ Agent successfully deployed and executed in TEE!${c.reset}\n`);
         console.log(`${c.dim}─${c.reset}`.repeat(50));
 
         const deployLabelCol = 26;
@@ -1256,18 +1175,16 @@ async function deploy() {
             console.log(`${c.bold}${labelText}${c.reset}${' '.repeat(pad)}${valueRendered}`);
         };
         deployDetailRow('📍 Wallet Address:', `${c.cyan}${data.wallet_address}${c.reset}`);
-        deployDetailRow('💻 Agent Output:', `${c.yellow}${data.execution_output ?? ''}${c.reset}`);
-        const att = data.attestation_b64;
-        deployDetailRow(
-            '🔐 Attestation:',
-            att ? `${att.substring(0, 30)}...` : `${c.dim}No attestation returned${c.reset}`
-        );
-        console.log(`${c.dim}─${c.reset}`.repeat(50));
-
-        console.log(`\n${c.yellow}Verify hardware proof at:${c.reset} https://teeify.xyz/verify\n`);
-        const webhookUrl = `${gatewayBase()}/agent/${encodeURIComponent(config.agent_name)}/execute`;
+        deployDetailRow('📦 Bundle Size:', `${c.dim}${formatBundleSize(agentCode.length)}${c.reset}`);
+        deployDetailRow('🧬 Logic Hash:', `${c.cyan}${logicHash}${c.reset}`);
+        const agentRef = data.agent_ref ?? `${authConfig.user_id}/${config.agent_name}`;
+        deployDetailRow('🔗 Agent ref:', `${c.cyan}${agentRef}${c.reset}`);
+        const webhookUrl = namespacedAgentUrl(authConfig.user_id, config.agent_name, 'execute');
         deployDetailRow('🔗 Webhook URL:', `${c.cyan}${webhookUrl}${c.reset}`);
-        deployDetailRow('🔑 Add header:', `${c.dim}Authorization: Bearer <YOUR_API_KEY>${c.reset}\n`);
+        deployDetailRow('🔑 Add header:', `${c.dim}Authorization: Bearer <YOUR_API_KEY>${c.reset}`);
+        console.log(`${c.dim}─${c.reset}`.repeat(50));
+        deployDetailRow('💻 Agent Output:', `${c.yellow}${data.execution_output ?? ''}${c.reset}`);
+        console.log(`\n${c.yellow}Verify this proof at:${c.reset} https://teeify.xyz/verify\n`);
 
     } catch (err) {
         process.exitCode = 1;
@@ -1275,7 +1192,7 @@ async function deploy() {
         
         // Native fetch handles connection refused differently than axios
         if (err.cause && err.cause.code === 'ECONNREFUSED') {
-            console.log(`${c.dim}Could not connect to Teeify Gateway at ${GATEWAY_URL}. Is your EC2 Axum server running on port 3000?${c.reset}\n`);
+            console.log(`${c.dim}Could not connect to Teeify Gateway at ${GATEWAY_URL}. Is your server running?${c.reset}\n`);
         } else {
             console.log(`${c.dim}${err.message}${c.reset}\n`);
         }
@@ -1288,9 +1205,9 @@ async function execute() {
     try {
         const body = parseExecuteBodyFromArgs(args);
         const config = readProjectConfig();
-        const authConfig = readAuthConfig();
+        const authConfig = requireAuthContext();
 
-        const url = `${gatewayBase()}/agent/${encodeURIComponent(config.agent_name)}/execute`;
+        const url = namespacedAgentUrl(authConfig.user_id, config.agent_name, 'execute');
 
         const response = await fetch(url, {
             method: 'POST',
@@ -1308,9 +1225,16 @@ async function execute() {
 
         const contentType = response.headers.get('content-type') || '';
         let agentOutput;
+        let attestation;
         if (contentType.includes('application/json')) {
             const data = await response.json();
             agentOutput = data.execution_output ?? data.output ?? '';
+            attestation = data.attestation_b64;
+
+            if (attestation) {
+                console.log(`${c.bold}🔐 Hardware Attestation (AWS Nitro)${c.reset}`);
+                console.log(`${c.dim}${attestation}${c.reset}\n`);
+            }
         } else {
             agentOutput = await response.text();
         }
@@ -1318,6 +1242,7 @@ async function execute() {
         const display = formatAgentOutputForTerminal(agentOutput);
         console.log(`${c.bold}💻 Agent Output${c.reset}`);
         console.log(`${c.yellow}${display}${c.reset}\n`);
+        console.log(`${c.yellow}Verify this proof at:${c.reset} https://teeify.xyz/verify\n`);
     } catch (err) {
         process.exitCode = 1;
         console.log(`\n${c.yellow}✖ Execute failed.${c.reset}`);
@@ -1371,20 +1296,62 @@ async function dev() {
 
         const teeifySecrets = loadLocalDotenvAsSecretsObject();
 
+        const { Wallet } = require('ethers');
+        const devKey = teeifySecrets.TEEIFY_DEV_PRIVATE_KEY;
+        let wallet = null;
+
+        if (devKey) {
+            try {
+                wallet = new Wallet(devKey);
+                console.log(
+                    `${c.dim}> Local Sim: Using internal signer for TEEIFY_DEV_PRIVATE_KEY (${wallet.address})${c.reset}`
+                );
+            } catch (e) {
+                console.log(`${c.yellow}⚠ Failed to initialize internal wallet: ${e.message}${c.reset}`);
+            }
+        }
+
         const mockSandbox = {
             TEEIFY_SECRETS: { ...teeifySecrets },
-            TEEIFY_REQUEST: teeifyRequest,
+            TEEIFY_REQUEST: {
+                ...teeifyRequest,
+                wallet_address: wallet ? wallet.address : '0xMOCK_AGENT_ADDRESS'
+            },
             teeify: {
+                address: wallet ? wallet.address : '0xMOCK_AGENT_ADDRESS',
                 fetch: async (...fetchArgs) => {
                     const res = await fetch(...fetchArgs);
                     return await res.text();
                 },
-                signMessage: async () => '0xMOCK_SIGNATURE_LOCAL_DEV'
+                signMessage: async (message) => {
+                    if (wallet) return await wallet.signMessage(message);
+                    return '0xMOCK_SIGNED_MESSAGE';
+                },
+                signTransaction: async (unsignedHash) => {
+                    if (wallet) {
+                        const signature = wallet.signingKey.sign(unsignedHash);
+                        return signature.serialized;
+                    }
+                    return '0xMOCK_SIGNED_TX';
+                }
             },
+            TextEncoder,
+            TextDecoder,
+            setTimeout,
+            clearTimeout,
+            setInterval,
+            clearInterval,
+            console,
             fetch: (...fetchArgs) => fetch(...fetchArgs),
             crypto: require('node:crypto').webcrypto,
-            console
+            globalThis: null,
+            self: null,
+            window: null
         };
+
+        mockSandbox.globalThis = mockSandbox;
+        mockSandbox.self = mockSandbox;
+        mockSandbox.window = mockSandbox;
 
         try {
             const completion = vm.runInNewContext(bundledCode, mockSandbox, {
@@ -1455,14 +1422,14 @@ async function secretsSet() {
 
         const value = valueParts.join(' ');
         const agentName = readSecretsProjectContext();
-        const authConfig = readAuthConfig();
+        const authConfig = requireAuthContext();
 
         console.log(`${c.dim}> Fetching enclave public key...${c.reset}`);
         const enclaveKey = await fetchEnclavePublicKey(authConfig.api_key);
         console.log(`${c.dim}> Encrypting value with RSA-OAEP (SHA-256)...${c.reset}`);
         const encrypted_value_b64 = encryptSecretValueRsa(value, enclaveKey.publicKeyPem);
 
-        const url = `${gatewayBase()}/agent/${encodeURIComponent(agentName)}/secrets`;
+        const url = namespacedAgentUrl(authConfig.user_id, agentName, 'secrets');
         const response = await fetch(url, {
             method: 'POST',
             headers: {
